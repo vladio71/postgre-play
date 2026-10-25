@@ -1,0 +1,20 @@
+{
+  "name": "sql-drills",
+  "version": "1.0.0",
+  "description": "SQL-вправи від JOIN до LATERAL і EXPLAIN. Postgres всередині Node, без Docker.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "list": "node run.mjs list",
+    "task": "node run.mjs task",
+    "check": "node run.mjs check",
+    "hint": "node run.mjs hint",
+    "solution": "node run.mjs solution",
+    "schema": "node run.mjs schema",
+    "play": "node run.mjs play",
+    "selftest": "node run.mjs selftest"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.5.11"
+  }
+}
