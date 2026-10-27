@@ -1,4 +1,4 @@
-import { PGlite } from '@electric-sql/pglite';
+import pg from 'pg';
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
@@ -7,7 +7,16 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DRILLS_DIR = path.join(ROOT, 'drills');
 const SOLUTIONS_DIR = path.join(ROOT, 'solutions');
+const SEED_DIR = path.join(ROOT, 'seed');
 const PROGRESS_FILE = path.join(ROOT, '.progress.json');
+const DB_URL = process.env.DATABASE_URL || 'postgres://drills:drills@localhost:5433/drills';
+
+// date і timestamp лишаємо рядками, щоб таймзона не зсувала день
+pg.types.setTypeParser(20, (v) => Number(v));    // bigint (count, sum)
+pg.types.setTypeParser(1700, (v) => Number(v));  // numeric (avg, round)
+pg.types.setTypeParser(1082, (v) => v);
+pg.types.setTypeParser(1114, (v) => v);
+pg.types.setTypeParser(1184, (v) => v);
 
 const STUB = (name) =>
   `-- ${name}\n-- Пиши свій запит тут. Перевірка: npm run check ${name.slice(0, 2)}\n\n`;
@@ -37,19 +46,43 @@ function findDrill(arg) {
   return name;
 }
 
+// Метадані еталону, рядки виду "-- ключ: значення":
+//   ordered: true          порядок рядків важливий
+//   needs: big, seed2      які додаткові сіди потрібні (seed.sql завжди)
+//   plan: <sql>            вправа на EXPLAIN: перевіряється план цього запиту
+//   plan-has / plan-not    слова, які мають / не мають бути в плані після my.sql
+//   race: N                my.sql виконується N разів одночасно (N з'єднань)
+//   hold: MS               перше з'єднання тримає транзакцію відкритою MS мілісекунд
+//                          після my.sql; решта мають встигнути за MS/2, інакше помилка
+//   probe: <sql>           після my.sql (і race) виконати цей запит і порівняти з еталоном
+//   hint: ...              підказки
 function readSolution(name) {
   const text = fs.readFileSync(path.join(SOLUTIONS_DIR, name + '.sql'), 'utf8');
-  const meta = { ordered: false, needs: null, plan: null, planHas: [], planNot: [], hints: [] };
+  const meta = {
+    ordered: false,
+    needs: [],
+    plan: null,
+    planHas: [],
+    planNot: [],
+    race: 1,
+    hold: 0,
+    probe: null,
+    hints: [],
+  };
   for (const line of text.split('\n')) {
-    const m = line.match(/^--\s*(ordered|needs|plan|plan-has|plan-not|hint):\s*(.*)$/);
+    const m = line.match(/^--\s*(ordered|needs|plan|plan-has|plan-not|race|hold|probe|hint):\s*(.*)$/);
     if (!m) continue;
     const [, key, value] = m;
-    if (key === 'ordered') meta.ordered = value.trim() === 'true';
-    if (key === 'needs') meta.needs = value.trim();
-    if (key === 'plan') meta.plan = value.trim();
-    if (key === 'plan-has') meta.planHas.push(value.trim());
-    if (key === 'plan-not') meta.planNot.push(value.trim());
-    if (key === 'hint') meta.hints.push(value.trim());
+    const v = value.trim();
+    if (key === 'ordered') meta.ordered = v === 'true';
+    if (key === 'needs') meta.needs = v.split(',').map((s) => s.trim()).filter(Boolean);
+    if (key === 'plan') meta.plan = v;
+    if (key === 'plan-has') meta.planHas.push(v);
+    if (key === 'plan-not') meta.planNot.push(v);
+    if (key === 'race') meta.race = Number(v) || 1;
+    if (key === 'hold') meta.hold = Number(v) || 0;
+    if (key === 'probe') meta.probe = v;
+    if (key === 'hint') meta.hints.push(v);
   }
   return { text, meta };
 }
@@ -75,17 +108,37 @@ function fail(message) {
 
 // ---------- база ----------
 
-async function createDb(needsBig) {
-  const db = new PGlite();
-  await db.exec(fs.readFileSync(path.join(ROOT, 'seed', 'seed.sql'), 'utf8'));
-  if (needsBig) await db.exec(fs.readFileSync(path.join(ROOT, 'seed', 'big.sql'), 'utf8'));
+async function connect() {
+  const client = new pg.Client({ connectionString: DB_URL });
+  try {
+    await client.connect();
+  } catch (error) {
+    fail(
+      `Не можу підключитись до Postgres (${DB_URL}).\n` +
+        `Запусти базу: npm run db\n` +
+        `Деталі: ${error.message}`,
+    );
+  }
+  await client.query('set statement_timeout = 10000');
+  return client;
+}
+
+// Чиста база на кожен запуск: скидаємо схему і заливаємо сіди.
+async function createDb(needs = []) {
+  const db = await connect();
+  await db.query('drop schema public cascade; create schema public;');
+  await db.query(fs.readFileSync(path.join(SEED_DIR, 'seed.sql'), 'utf8'));
+  for (const extra of needs) {
+    await db.query(fs.readFileSync(path.join(SEED_DIR, extra + '.sql'), 'utf8'));
+  }
   return db;
 }
 
 // Виконує весь файл, результат = остання команда, яка повернула колонки.
 async function runSql(db, sql) {
   try {
-    const results = await db.exec(sql, { rowMode: 'array' });
+    let results = await db.query({ text: sql, rowMode: 'array' });
+    if (!Array.isArray(results)) results = [results];
     const withColumns = results.filter((r) => r.fields && r.fields.length > 0);
     const last = withColumns[withColumns.length - 1];
     if (!last) return { ok: true, columns: [], rows: [] };
@@ -104,6 +157,8 @@ function normalizeValue(value) {
     return iso.endsWith('T00:00:00.000Z') ? iso.slice(0, 10) : iso;
   }
   if (typeof value === 'string' && /^-?\d+(\.\d+)?$/.test(value)) return String(Number(value));
+  if (Array.isArray(value)) return JSON.stringify(value.map(normalizeValue));
+  if (typeof value === 'object') return JSON.stringify(value);
   return String(value);
 }
 
@@ -161,19 +216,71 @@ async function explain(db, query) {
   return result.rows.map((r) => r['QUERY PLAN']).join('\n');
 }
 
+// Виконує sql у N окремих з'єднаннях одночасно. Повертає помилки (якщо були).
+// З hold: з'єднання 0 робить begin; sql; чекає hold мс; commit. Так інші реально
+// натикаються на його замки, а не на вже закомічені рядки.
+async function runRace(sql, n, hold = 0) {
+  const clients = [];
+  for (let i = 0; i < n; i += 1) clients.push(await connect());
+  const tasks = clients.map(async (c, i) => {
+    if (hold && i === 0) {
+      const r = await runSql(c, 'begin;\n' + sql);
+      await new Promise((resolve) => setTimeout(resolve, hold));
+      await runSql(c, r.ok ? 'commit' : 'rollback');
+      return r;
+    }
+    if (hold) await c.query(`set statement_timeout = ${Math.floor(hold / 2)}`);
+    return runSql(c, sql);
+  });
+  const results = await Promise.all(tasks);
+  await Promise.all(clients.map((c) => c.end()));
+  return results.filter((r) => !r.ok).map((r) => r.error);
+}
+
+// Вправа зі станом: виконати my.sql (можливо паралельно), потім probe, порівняти з еталоном.
+async function evaluateState(name, mySql, solutionSql, meta) {
+  const dbExp = await createDb(meta.needs);
+  const errExp = await runRace(solutionSql, meta.race, meta.hold);
+  if (errExp.length) fail(`Еталон ${name} зламаний: ${errExp[0]}`);
+  const expected = await runSql(dbExp, meta.probe);
+  await dbExp.end();
+
+  const dbMine = await createDb(meta.needs);
+  const errMine = await runRace(mySql, meta.race, meta.hold);
+  const mine = await runSql(dbMine, meta.probe);
+  await dbMine.end();
+
+  const report = [];
+  if (errMine.length) report.push('Помилки під час виконання: ' + errMine.join(' | '));
+  const { problems } = compareResults(expected, mine, true);
+  if (problems.length === 0 && errMine.length === 0) return { passed: true, report };
+  report.push(`Стан бази після ${meta.race > 1 ? meta.race + ' одночасних запусків' : 'твого запиту'}:`);
+  report.push({ table: mine });
+  report.push('Очікується:');
+  report.push({ table: expected });
+  report.push(...problems);
+  return { passed: false, report };
+}
+
 // Повертає { passed, report: [рядки тексту] }
 async function evaluate(name, mySql) {
   const { text: solutionSql, meta } = readSolution(name);
-  const needsBig = meta.needs === 'big';
-  const db = await createDb(needsBig);
+
+  if (meta.probe) return evaluateState(name, mySql, solutionSql, meta);
+
+  const db = await createDb(meta.needs);
   const report = [];
 
   if (meta.plan) {
     const before = await explain(db, meta.plan);
     const run = await runSql(db, mySql);
-    if (!run.ok) return { passed: false, report: ['Помилка SQL: ' + run.error] };
-    await db.exec('analyze');
+    if (!run.ok) {
+      await db.end();
+      return { passed: false, report: ['Помилка SQL: ' + run.error] };
+    }
+    await db.query('vacuum analyze');
     const after = await explain(db, meta.plan);
+    await db.end();
     const problems = [];
     for (const word of meta.planHas) {
       if (!after.includes(word)) problems.push(`У плані має бути "${word}".`);
@@ -187,9 +294,11 @@ async function evaluate(name, mySql) {
   }
 
   const expected = await runSql(db, solutionSql);
+  await db.end();
   if (!expected.ok) fail(`Еталон ${name} зламаний: ${expected.error}`);
-  const dbMine = await createDb(needsBig);
+  const dbMine = await createDb(meta.needs);
   const mine = await runSql(dbMine, mySql);
+  await dbMine.end();
   if (!mine.ok) return { passed: false, report: ['Помилка SQL: ' + mine.error] };
   if (mine.columns.length === 0) {
     return { passed: false, report: ['Запит нічого не повернув. Напиши select у my.sql.'] };
@@ -245,9 +354,10 @@ async function cmdTask(arg) {
   const name = findDrill(arg);
   console.log(fs.readFileSync(path.join(DRILLS_DIR, name, 'task.md'), 'utf8'));
   const { text, meta } = readSolution(name);
-  if (!meta.plan) {
-    const db = await createDb(meta.needs === 'big');
+  if (!meta.plan && !meta.probe) {
+    const db = await createDb(meta.needs);
     const expected = await runSql(db, text);
+    await db.end();
     console.log('Очікуваний результат' + (meta.ordered ? ' (порядок важливий):' : ' (порядок неважливий):'));
     showTable(expected.columns, expected.rows, 20);
   }
@@ -289,21 +399,30 @@ async function cmdSolution(arg, force) {
   console.log(fs.readFileSync(path.join(SOLUTIONS_DIR, name + '.sql'), 'utf8'));
 }
 
+function allSeeds() {
+  return fs
+    .readdirSync(SEED_DIR)
+    .filter((f) => f.endsWith('.sql') && f !== 'seed.sql')
+    .map((f) => f.replace(/\.sql$/, ''));
+}
+
 async function cmdSchema() {
-  const db = await createDb(true);
+  const db = await createDb(allSeeds());
   const result = await db.query(
     `select table_name, string_agg(column_name || ' ' || data_type, ', ' order by ordinal_position) as columns
      from information_schema.columns where table_schema = 'public'
      group by table_name order by table_name`,
   );
+  await db.end();
   for (const row of result.rows) console.log(`${row.table_name}\n  ${row.columns}\n`);
 }
 
 async function cmdPlay(args) {
-  const db = await createDb(true);
+  const db = await createDb(allSeeds());
   const inline = args.join(' ').trim();
   if (inline) {
     const result = await runSql(db, inline);
+    await db.end();
     if (!result.ok) return console.error('Помилка SQL: ' + result.error);
     return showTable(result.columns, result.rows, 50);
   }
@@ -324,6 +443,7 @@ async function cmdPlay(args) {
     rl.prompt();
   }
   rl.close();
+  await db.end();
 }
 
 // Перевірка самого репо: еталони проходять, порожні заготовки ні.

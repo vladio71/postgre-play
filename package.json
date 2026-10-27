@@ -1,10 +1,12 @@
 {
   "name": "sql-drills",
   "version": "1.0.0",
-  "description": "SQL-вправи від JOIN до LATERAL і EXPLAIN. Postgres всередині Node, без Docker.",
+  "description": "SQL-вправи від JOIN до LATERAL, EXPLAIN і одночасних запитів. Postgres у Docker.",
   "type": "module",
   "private": true,
   "scripts": {
+    "db": "docker compose up -d",
+    "db:stop": "docker compose down",
     "list": "node run.mjs list",
     "task": "node run.mjs task",
     "check": "node run.mjs check",
@@ -15,6 +17,6 @@
     "selftest": "node run.mjs selftest"
   },
   "dependencies": {
-    "@electric-sql/pglite": "^0.5.11"
+    "pg": "^8.23.1"
   }
 }

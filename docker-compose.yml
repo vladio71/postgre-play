@@ -1,0 +1,12 @@
+services:
+  db:
+    image: postgres:16
+    container_name: sql-drills-db
+    environment:
+      POSTGRES_USER: drills
+      POSTGRES_PASSWORD: drills
+      POSTGRES_DB: drills
+    ports:
+      - "5433:5432"
+    tmpfs:
+      - /var/lib/postgresql/data

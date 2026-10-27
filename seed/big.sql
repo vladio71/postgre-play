@@ -17,5 +17,7 @@ select g,
        date '2024-01-01' + (g % 365)
 from generate_series(1, 100000) g;
 
+create index big_users_email_idx on big_users (email);   -- для вправи 32
+
 analyze big_users;
 analyze big_orders;
