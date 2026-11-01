@@ -6,7 +6,7 @@
 npm install
 npm run list              # всі вправи, що пройдено
 npm run task 05           # завдання + очікуваний результат
-# пиши запит у drills/05-inner-join/my.sql
+# пиши запит у drills/05-inner-join/my.sql (файл створюється сам)
 npm run check 05          # перевірка
 npm run hint 05           # підказки
 npm run solution 05       # еталон (відкривається після ✓)
