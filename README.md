@@ -2,6 +2,8 @@
 
 22 вправи з SQL від `where` до `lateral` і `EXPLAIN`. Postgres працює всередині Node (PGlite), Docker не потрібен.
 
+Теорія до вправ (SQL і NoSQL, з посиланнями на номери вправ): [docs/sql-nosql-teoriya.pdf](docs/sql-nosql-teoriya.pdf)
+
 ```
 npm install
 npm run list              # всі вправи, що пройдено
